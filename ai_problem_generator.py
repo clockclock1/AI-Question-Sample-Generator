@@ -652,6 +652,7 @@ class App:
         self.test_cases: List[Dict[str, str]] = []
         self.image_paths: List[str] = []
         self.pasted_image_dir = os.path.join(os.getcwd(), "pasted_images")
+        self.runtime_solution_dir = os.path.join(os.getcwd(), "runtime_solutions")
 
         self._build_ui()
         self.root.bind_all("<Control-Shift-V>", self._paste_image_from_clipboard)
@@ -832,6 +833,15 @@ class App:
         self.code_text.delete("1.0", tk.END)
         self.code_text.insert("1.0", code)
 
+    def _persist_runtime_solution(self, code: str, source: str, attempt: int) -> str:
+        os.makedirs(self.runtime_solution_dir, exist_ok=True)
+        ts = int(time.time() * 1000)
+        file_name = f"{source}_attempt{attempt}_{ts}.py"
+        path = os.path.join(self.runtime_solution_dir, file_name)
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(clean_code_text(code))
+        return path
+
     def _set_runner_output(self, text: str) -> None:
         self.run_output_text.configure(state="normal")
         self.run_output_text.delete("1.0", tk.END)
@@ -881,39 +891,38 @@ class App:
 
     def _manual_run_worker(self, code: str, run_input: str, timeout_sec: int, run_after_compile: bool) -> None:
         try:
-            with tempfile.TemporaryDirectory(prefix="manual_runner_") as run_dir:
-                code_path = write_standard_code_file(code, run_dir)
-                self._log(f"手动模式标准代码文件：{code_path}")
-                ok, compile_msg = compile_python_file(code_path)
-                if not ok:
-                    out = "[Compile] Failed\n\n" + compile_msg
-                    self._log("手动编译检查失败")
-                    self.root.after(0, lambda: self._set_runner_output(out))
-                    return
-
-                if not run_after_compile:
-                    self._log("手动编译检查通过")
-                    self.root.after(0, lambda: self._set_runner_output("[Compile] Success"))
-                    return
-
-                result = run_python_file_once(code_path, run_input, timeout_sec=timeout_sec)
-                out_lines = [
-                    "[Compile] Success",
-                    "",
-                    f"[Run] reason={result.reason}, return_code={result.return_code}, timeout={timeout_sec}s",
-                    "",
-                    "[Stdout]",
-                    result.actual_output if result.actual_output else "<empty>",
-                    "",
-                    "[Stderr]",
-                    result.stderr if result.stderr else "<empty>",
-                ]
-                out = "\n".join(out_lines)
-                if result.ok:
-                    self._log("手动运行完成")
-                else:
-                    self._log(f"手动运行失败：{result.reason}")
+            code_path = self._persist_runtime_solution(code, source="manual_input", attempt=1)
+            self._log(f"手动模式执行文件：{code_path}")
+            ok, compile_msg = compile_python_file(code_path)
+            if not ok:
+                out = "[Compile] Failed\n\n" + compile_msg
+                self._log("手动编译检查失败")
                 self.root.after(0, lambda: self._set_runner_output(out))
+                return
+
+            if not run_after_compile:
+                self._log("手动编译检查通过")
+                self.root.after(0, lambda: self._set_runner_output("[Compile] Success"))
+                return
+
+            result = run_python_file_once(code_path, run_input, timeout_sec=timeout_sec)
+            out_lines = [
+                "[Compile] Success",
+                "",
+                f"[Run] reason={result.reason}, return_code={result.return_code}, timeout={timeout_sec}s",
+                "",
+                "[Stdout]",
+                result.actual_output if result.actual_output else "<empty>",
+                "",
+                "[Stderr]",
+                result.stderr if result.stderr else "<empty>",
+            ]
+            out = "\n".join(out_lines)
+            if result.ok:
+                self._log("手动运行完成")
+            else:
+                self._log(f"手动运行失败：{result.reason}")
+            self.root.after(0, lambda: self._set_runner_output(out))
         except Exception as e:
             self._log(f"手动运行异常：{e}")
             self.root.after(0, lambda: self._set_runner_output(f"[Error]\n{e}"))
@@ -1147,6 +1156,7 @@ class App:
             timeout_sec = DEFAULT_TIMEOUT_SEC
 
         code = clean_code_text(payload["code"])
+        code_source = "manual_input" if code else "ai_generated"
         cases = payload["test_cases"]
 
         title = user_title or "未命名题目"
@@ -1173,6 +1183,8 @@ class App:
             code = clean_code_text(safe_text(generated.get("code"), ""))
             if not code:
                 raise RuntimeError("AI 返回中没有 code 字段")
+            self.root.after(0, lambda c=code: self._set_code_text(c))
+            self._log("已写入 AI 生成代码到代码区")
 
             title = safe_text(user_title, safe_text(generated.get("title"), "未命名题目"))
             description = safe_text(generated.get("description"), problem_text)
@@ -1212,35 +1224,35 @@ class App:
 
         for attempt in range(1, max_attempts + 1):
             self._log(f"开始执行校验，尝试 {attempt}/{max_attempts}")
-            with tempfile.TemporaryDirectory(prefix="ai_problem_runner_") as run_dir:
-                code_path = write_standard_code_file(code, run_dir)
-                self._log(f"本轮执行标准代码文件：{code_path}")
-                compile_ok, compile_msg = compile_python_file(code_path)
-                if not compile_ok:
-                    self._log("编译检查失败")
-                    passed = False
-                    details = [
-                        {
-                            "index": 0,
-                            "input": "",
-                            "expected": "",
-                            "actual": "",
-                            "stderr": compile_msg,
-                            "return_code": 1,
-                            "reason": "compile_error",
-                            "passed": False,
-                            "compared": False,
-                        }
-                    ]
-                    adjusted_cases = final_cases
-                else:
-                    self._log("编译检查通过，开始执行测试")
-                    passed, details, adjusted_cases = run_and_validate(
-                        code_path,
-                        final_cases,
-                        self._log,
-                        timeout_sec=timeout_sec,
-                    )
+            code_path = self._persist_runtime_solution(code, source=code_source, attempt=attempt)
+            self._log(f"本轮执行来源：{code_source}")
+            self._log(f"本轮执行标准代码文件：{code_path}")
+            compile_ok, compile_msg = compile_python_file(code_path)
+            if not compile_ok:
+                self._log("编译检查失败")
+                passed = False
+                details = [
+                    {
+                        "index": 0,
+                        "input": "",
+                        "expected": "",
+                        "actual": "",
+                        "stderr": compile_msg,
+                        "return_code": 1,
+                        "reason": "compile_error",
+                        "passed": False,
+                        "compared": False,
+                    }
+                ]
+                adjusted_cases = final_cases
+            else:
+                self._log("编译检查通过，开始执行测试")
+                passed, details, adjusted_cases = run_and_validate(
+                    code_path,
+                    final_cases,
+                    self._log,
+                    timeout_sec=timeout_sec,
+                )
             final_cases = adjusted_cases
 
             if passed:
@@ -1268,6 +1280,8 @@ class App:
                 if not new_code:
                     raise RuntimeError("AI 修复返回为空代码")
                 code = new_code
+                code_source = "ai_repaired"
+                self.root.after(0, lambda c=code: self._set_code_text(c))
                 self._log("已获取修复后的代码，继续校验")
             else:
                 fail_count = sum(1 for d in details if not d.get("passed"))
