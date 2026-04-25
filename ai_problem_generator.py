@@ -20,6 +20,11 @@ from urllib import error, request
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+try:
+    from PIL import ImageGrab
+except ImportError:
+    ImageGrab = None
+
 
 LANGUAGES = [
     "C",
@@ -52,15 +57,30 @@ SYSTEM_PROMPT = (
 )
 
 
-def normalize_chat_url(url: str) -> str:
+def normalize_base_url(url: str) -> str:
     clean = url.strip().rstrip("/")
     if not clean:
         return ""
-    if "chat/completions" in clean:
-        return clean
+
+    if clean.endswith("/chat/completions"):
+        return clean[: -len("/chat/completions")]
+    if clean.endswith("/models"):
+        return clean[: -len("/models")]
     if clean.endswith("/v1"):
-        return f"{clean}/chat/completions"
-    return f"{clean}/chat/completions"
+        return clean
+    if "/v1/" in clean:
+        return clean.split("/v1/")[0] + "/v1"
+    return f"{clean}/v1"
+
+
+def normalize_chat_url(url: str) -> str:
+    base = normalize_base_url(url)
+    return f"{base}/chat/completions" if base else ""
+
+
+def normalize_models_url(url: str) -> str:
+    base = normalize_base_url(url)
+    return f"{base}/models" if base else ""
 
 
 def file_to_data_url(path: str) -> str:
@@ -240,22 +260,94 @@ def build_failure_report(details: List[Dict[str, Any]]) -> str:
     return "\n".join(lines).strip()
 
 
-def post_chat_completions(
+def post_chat_completions_stream(
     api_url: str,
     api_key: str,
     model: str,
     messages: List[Dict[str, Any]],
-    timeout: int = 120,
+    timeout: int = 180,
+    on_chunk=None,
 ) -> str:
     payload = {
         "model": model,
         "messages": messages,
         "temperature": 0.2,
+        "stream": True,
     }
 
     data = json.dumps(payload).encode("utf-8")
     req = request.Request(api_url, data=data, method="POST")
     req.add_header("Content-Type", "application/json")
+    req.add_header("Accept", "text/event-stream")
+    if api_key:
+        req.add_header("Authorization", f"Bearer {api_key}")
+
+    chunks: List[str] = []
+
+    try:
+        with request.urlopen(req, timeout=timeout) as resp:
+            for raw_line in resp:
+                line = raw_line.decode("utf-8", errors="replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+
+                data_line = line[len("data:") :].strip()
+                if not data_line:
+                    continue
+                if data_line == "[DONE]":
+                    break
+
+                try:
+                    event = json.loads(data_line)
+                except json.JSONDecodeError:
+                    continue
+
+                if "error" in event:
+                    raise RuntimeError(f"AI 错误: {json.dumps(event['error'], ensure_ascii=False)}")
+
+                choices = event.get("choices") or []
+                if not choices:
+                    continue
+                delta = choices[0].get("delta", {})
+                content = delta.get("content", "")
+
+                piece = ""
+                if isinstance(content, str):
+                    piece = content
+                elif isinstance(content, list):
+                    text_parts = []
+                    for part in content:
+                        if isinstance(part, dict) and part.get("type") == "text":
+                            text_parts.append(str(part.get("text", "")))
+                        elif isinstance(part, str):
+                            text_parts.append(part)
+                    piece = "".join(text_parts)
+                elif content:
+                    piece = str(content)
+
+                if piece:
+                    chunks.append(piece)
+                    if on_chunk:
+                        on_chunk(piece)
+    except error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {e.code}: {body}") from e
+    except error.URLError as e:
+        raise RuntimeError(f"网络错误: {e}") from e
+
+    merged = "".join(chunks)
+    if not merged.strip():
+        raise RuntimeError("AI 流式响应为空")
+    return merged
+
+
+def fetch_available_models(api_url: str, api_key: str, timeout: int = 30) -> List[str]:
+    models_url = normalize_models_url(api_url)
+    if not models_url:
+        raise ValueError("请先填写 API URL")
+
+    req = request.Request(models_url, method="GET")
+    req.add_header("Accept", "application/json")
     if api_key:
         req.add_header("Authorization", f"Bearer {api_key}")
 
@@ -264,35 +356,30 @@ def post_chat_completions(
             raw = resp.read().decode("utf-8", errors="replace")
     except error.HTTPError as e:
         body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {e.code}: {body}") from e
+        raise RuntimeError(f"拉取模型失败 HTTP {e.code}: {body}") from e
     except error.URLError as e:
-        raise RuntimeError(f"网络错误: {e}") from e
+        raise RuntimeError(f"拉取模型失败: {e}") from e
 
     try:
         payload_json = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise RuntimeError(f"AI 返回非 JSON: {raw[:500]}") from e
+        raise RuntimeError(f"模型接口返回非 JSON: {raw[:500]}") from e
 
-    choices = payload_json.get("choices") or []
-    if not choices:
-        raise RuntimeError(f"AI 返回中缺少 choices 字段: {raw[:500]}")
+    data_list = payload_json.get("data")
+    if not isinstance(data_list, list):
+        raise RuntimeError(f"模型接口返回异常: {raw[:500]}")
 
-    msg = choices[0].get("message", {})
-    content = msg.get("content", "")
+    model_ids: List[str] = []
+    for item in data_list:
+        if isinstance(item, dict):
+            mid = str(item.get("id", "")).strip()
+            if mid:
+                model_ids.append(mid)
 
-    if isinstance(content, list):
-        text_parts = []
-        for part in content:
-            if isinstance(part, dict) and part.get("type") == "text":
-                text_parts.append(part.get("text", ""))
-            elif isinstance(part, str):
-                text_parts.append(part)
-        content = "\n".join(text_parts)
+    if not model_ids:
+        raise RuntimeError("未拉取到任何模型")
 
-    if not isinstance(content, str):
-        content = str(content)
-
-    return content
+    return sorted(set(model_ids))
 
 
 def generate_code_with_ai(
@@ -302,6 +389,7 @@ def generate_code_with_ai(
     problem_text: str,
     image_paths: List[str],
     logger,
+    stream_callback=None,
 ) -> Dict[str, Any]:
     content_parts: List[Dict[str, Any]] = [
         {
@@ -327,8 +415,8 @@ def generate_code_with_ai(
         {"role": "user", "content": content_parts},
     ]
 
-    logger("调用 AI 生成代码中...")
-    raw = post_chat_completions(api_url, api_key, model, messages)
+    logger("调用 AI 生成代码中（流式）...")
+    raw = post_chat_completions_stream(api_url, api_key, model, messages, on_chunk=stream_callback)
     parsed = extract_json_block(raw)
     return parsed
 
@@ -342,6 +430,7 @@ def repair_code_with_ai(
     failure_report: str,
     test_cases: List[Dict[str, str]],
     logger,
+    stream_callback=None,
 ) -> Dict[str, Any]:
     fix_prompt = (
         "你之前生成的代码未通过测试，请修复。"
@@ -357,8 +446,8 @@ def repair_code_with_ai(
         {"role": "user", "content": fix_prompt},
     ]
 
-    logger("调用 AI 修复代码中...")
-    raw = post_chat_completions(api_url, api_key, model, messages)
+    logger("调用 AI 修复代码中（流式）...")
+    raw = post_chat_completions_stream(api_url, api_key, model, messages, on_chunk=stream_callback)
     parsed = extract_json_block(raw)
     return parsed
 
@@ -484,13 +573,16 @@ class App:
     def __init__(self, root: tk.Tk):
         self.root = root
         self.root.title("AI 题目样例生成器")
-        self.root.geometry("1220x860")
+        self.root.geometry("1320x900")
+        self.root.minsize(1100, 760)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
         self.test_cases: List[Dict[str, str]] = []
         self.image_paths: List[str] = []
+        self.pasted_image_dir = os.path.join(os.getcwd(), "pasted_images")
 
         self._build_ui()
+        self.root.bind_all("<Control-Shift-V>", self._paste_image_from_clipboard)
         self.root.after(100, self._drain_log_queue)
 
     def _build_ui(self) -> None:
@@ -500,66 +592,84 @@ class App:
         config_frame = ttk.LabelFrame(main, text="AI 配置")
         config_frame.pack(fill=tk.X, padx=2, pady=4)
 
-        ttk.Label(config_frame, text="API URL").grid(row=0, column=0, sticky="w", padx=4, pady=4)
-        self.api_url_var = tk.StringVar(value="https://api.openai.com/v1/chat/completions")
-        ttk.Entry(config_frame, textvariable=self.api_url_var, width=95).grid(row=0, column=1, sticky="we", padx=4, pady=4)
+        ttk.Label(config_frame, text="API URL").grid(row=0, column=0, sticky="w", padx=6, pady=6)
+        self.api_url_var = tk.StringVar(value="https://api.openai.com/v1")
+        ttk.Entry(config_frame, textvariable=self.api_url_var).grid(row=0, column=1, columnspan=4, sticky="we", padx=6, pady=6)
 
-        ttk.Label(config_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(config_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         self.api_key_var = tk.StringVar()
-        ttk.Entry(config_frame, textvariable=self.api_key_var, width=95, show="*").grid(row=1, column=1, sticky="we", padx=4, pady=4)
+        ttk.Entry(config_frame, textvariable=self.api_key_var, show="*").grid(row=1, column=1, columnspan=4, sticky="we", padx=6, pady=6)
 
-        ttk.Label(config_frame, text="Model").grid(row=2, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(config_frame, text="Model").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         self.model_var = tk.StringVar(value="gpt-4o-mini")
-        ttk.Entry(config_frame, textvariable=self.model_var, width=40).grid(row=2, column=1, sticky="w", padx=4, pady=4)
-        config_frame.columnconfigure(1, weight=1)
+        self.model_combo = ttk.Combobox(config_frame, textvariable=self.model_var, values=["gpt-4o-mini"])
+        self.model_combo.grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        self.refresh_models_btn = ttk.Button(config_frame, text="拉取模型", command=self._refresh_models)
+        self.refresh_models_btn.grid(row=2, column=2, sticky="w", padx=6, pady=6)
+        ttk.Label(config_frame, text="流式请求: 已启用").grid(row=2, column=3, sticky="w", padx=6, pady=6)
+        config_frame.columnconfigure(1, weight=3)
+        config_frame.columnconfigure(4, weight=2)
 
-        content_frame = ttk.Frame(main)
-        content_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
+        body_pane = ttk.Panedwindow(main, orient=tk.HORIZONTAL)
+        body_pane.pack(fill=tk.BOTH, expand=True, padx=2, pady=4)
 
-        left = ttk.Frame(content_frame)
-        right = ttk.Frame(content_frame)
-        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        right.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        left = ttk.Frame(body_pane)
+        right = ttk.Frame(body_pane)
+        body_pane.add(left, weight=3)
+        body_pane.add(right, weight=2)
 
         problem_frame = ttk.LabelFrame(left, text="题目信息")
         problem_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
 
-        ttk.Label(problem_frame, text="标题").pack(anchor="w", padx=6, pady=(6, 0))
+        ttk.Label(problem_frame, text="标题").pack(anchor="w", padx=8, pady=(8, 0))
         self.title_var = tk.StringVar()
-        ttk.Entry(problem_frame, textvariable=self.title_var).pack(fill=tk.X, padx=6, pady=4)
+        ttk.Entry(problem_frame, textvariable=self.title_var).pack(fill=tk.X, padx=8, pady=4)
 
-        ttk.Label(problem_frame, text="题目文字信息").pack(anchor="w", padx=6, pady=(6, 0))
-        self.problem_text = tk.Text(problem_frame, height=15, wrap="word")
-        self.problem_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        ttk.Label(problem_frame, text="题目文字信息").pack(anchor="w", padx=8, pady=(6, 0))
+        self.problem_text = tk.Text(problem_frame, height=16, wrap="word")
+        self.problem_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
 
-        image_frame = ttk.LabelFrame(left, text="截图输入（可多选）")
+        image_frame = ttk.LabelFrame(left, text="截图输入（可多选，可粘贴）")
         image_frame.pack(fill=tk.BOTH, expand=False)
 
-        self.image_list = tk.Listbox(image_frame, height=6)
-        self.image_list.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        ttk.Label(
+            image_frame,
+            text="支持文件添加，或使用 Ctrl+Shift+V 粘贴剪贴板截图",
+        ).pack(anchor="w", padx=8, pady=(8, 2))
+
+        self.image_list = tk.Listbox(image_frame, height=8)
+        self.image_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=6)
 
         image_btn_row = ttk.Frame(image_frame)
-        image_btn_row.pack(fill=tk.X, padx=6, pady=(0, 6))
+        image_btn_row.pack(fill=tk.X, padx=8, pady=(0, 8))
         ttk.Button(image_btn_row, text="添加截图", command=self._add_images).pack(side=tk.LEFT)
+        ttk.Button(image_btn_row, text="粘贴截图", command=self._paste_image_from_clipboard).pack(side=tk.LEFT, padx=6)
         ttk.Button(image_btn_row, text="移除选中", command=self._remove_selected_image).pack(side=tk.LEFT, padx=6)
         ttk.Button(image_btn_row, text="清空截图", command=self._clear_images).pack(side=tk.LEFT)
 
-        code_frame = ttk.LabelFrame(right, text="正确代码（可空，空则自动生成）")
-        code_frame.pack(fill=tk.BOTH, expand=True, pady=(0, 6))
+        right_tabs = ttk.Notebook(right)
+        right_tabs.pack(fill=tk.BOTH, expand=True)
 
-        self.code_text = tk.Text(code_frame, height=16, wrap="none")
-        self.code_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        code_tab = ttk.Frame(right_tabs)
+        case_tab = ttk.Frame(right_tabs)
+        right_tabs.add(code_tab, text="代码")
+        right_tabs.add(case_tab, text="测试用例")
 
-        case_frame = ttk.LabelFrame(right, text="测试用例（可多组）")
-        case_frame.pack(fill=tk.BOTH, expand=True)
+        code_frame = ttk.LabelFrame(code_tab, text="正确代码（可空，空则自动生成）")
+        code_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
+        self.code_text = tk.Text(code_frame, height=20, wrap="none")
+        self.code_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
+
+        case_frame = ttk.LabelFrame(case_tab, text="测试用例（可多组）")
+        case_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
         case_top = ttk.Frame(case_frame)
-        case_top.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        case_top.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
         in_box = ttk.Frame(case_top)
         out_box = ttk.Frame(case_top)
         in_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        out_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(6, 0))
+        out_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
 
         ttk.Label(in_box, text="Input").pack(anchor="w")
         self.case_input_text = tk.Text(in_box, height=8, wrap="word")
@@ -570,34 +680,35 @@ class App:
         self.case_output_text.pack(fill=tk.BOTH, expand=True)
 
         case_btns = ttk.Frame(case_frame)
-        case_btns.pack(fill=tk.X, padx=6, pady=(0, 6))
+        case_btns.pack(fill=tk.X, padx=8, pady=(0, 8))
         ttk.Button(case_btns, text="新增/更新当前用例", command=self._upsert_case).pack(side=tk.LEFT)
         ttk.Button(case_btns, text="删除选中用例", command=self._delete_case).pack(side=tk.LEFT, padx=6)
         ttk.Button(case_btns, text="清空用例", command=self._clear_cases).pack(side=tk.LEFT)
 
         self.case_list = tk.Listbox(case_frame, height=6)
-        self.case_list.pack(fill=tk.BOTH, expand=True, padx=6, pady=(0, 6))
+        self.case_list.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self.case_list.bind("<<ListboxSelect>>", self._on_case_select)
 
         output_frame = ttk.LabelFrame(main, text="导出配置")
         output_frame.pack(fill=tk.X, padx=2, pady=4)
 
-        ttk.Label(output_frame, text="输出目录").grid(row=0, column=0, sticky="w", padx=4, pady=4)
+        ttk.Label(output_frame, text="输出目录").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         self.output_dir_var = tk.StringVar(value=os.getcwd())
-        ttk.Entry(output_frame, textvariable=self.output_dir_var, width=90).grid(row=0, column=1, sticky="we", padx=4, pady=4)
-        ttk.Button(output_frame, text="选择目录", command=self._choose_output_dir).grid(row=0, column=2, padx=4, pady=4)
+        ttk.Entry(output_frame, textvariable=self.output_dir_var).grid(row=0, column=1, sticky="we", padx=6, pady=6)
+        ttk.Button(output_frame, text="选择目录", command=self._choose_output_dir).grid(row=0, column=2, padx=6, pady=6)
         output_frame.columnconfigure(1, weight=1)
 
         action_frame = ttk.Frame(main)
-        action_frame.pack(fill=tk.X, padx=2, pady=6)
+        action_frame.pack(fill=tk.X, padx=2, pady=4)
         self.run_btn = ttk.Button(action_frame, text="开始处理并导出", command=self._start)
         self.run_btn.pack(side=tk.LEFT)
+        ttk.Button(action_frame, text="清空日志", command=self._clear_logs).pack(side=tk.LEFT, padx=8)
 
         log_frame = ttk.LabelFrame(main, text="运行日志")
         log_frame.pack(fill=tk.BOTH, expand=False, padx=2, pady=4)
 
         self.log_text = tk.Text(log_frame, height=12, wrap="word", state="disabled")
-        self.log_text.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
+        self.log_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
     def _log(self, msg: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
@@ -615,15 +726,87 @@ class App:
             self.log_text.configure(state="disabled")
         self.root.after(100, self._drain_log_queue)
 
+    def _clear_logs(self) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
+    def _refresh_models(self) -> None:
+        api_url = self.api_url_var.get().strip()
+        if not api_url:
+            messagebox.showerror("错误", "请先填写 API URL")
+            return
+        api_key = self.api_key_var.get().strip()
+        self.refresh_models_btn.configure(state="disabled")
+        self._log("开始拉取模型列表...")
+        threading.Thread(target=self._refresh_models_worker, args=(api_url, api_key), daemon=True).start()
+
+    def _refresh_models_worker(self, api_url: str, api_key: str) -> None:
+        try:
+            models = fetch_available_models(
+                api_url=api_url,
+                api_key=api_key,
+            )
+            self.root.after(0, lambda: self._apply_models(models))
+            self._log(f"模型拉取成功，共 {len(models)} 个")
+        except Exception as e:
+            self._log(f"模型拉取失败：{e}")
+            self.root.after(0, lambda: messagebox.showerror("拉取模型失败", str(e)))
+        finally:
+            self.root.after(0, lambda: self.refresh_models_btn.configure(state="normal"))
+
+    def _apply_models(self, models: List[str]) -> None:
+        self.model_combo["values"] = models
+        cur = self.model_var.get().strip()
+        if not cur or cur not in models:
+            self.model_var.set(models[0])
+
+    def _add_image_path(self, path: str) -> None:
+        norm = os.path.abspath(path)
+        if norm not in self.image_paths:
+            self.image_paths.append(norm)
+            self.image_list.insert(tk.END, norm)
+
     def _add_images(self) -> None:
         files = filedialog.askopenfilenames(
             title="选择截图",
             filetypes=[("Image Files", "*.png *.jpg *.jpeg *.bmp *.webp"), ("All", "*.*")],
         )
         for p in files:
-            if p not in self.image_paths:
-                self.image_paths.append(p)
-                self.image_list.insert(tk.END, p)
+            self._add_image_path(p)
+
+    def _paste_image_from_clipboard(self, _event=None) -> str:
+        if ImageGrab is None:
+            self._log("未安装 pillow，无法粘贴截图")
+            messagebox.showwarning("提示", "粘贴截图依赖 pillow，请先安装：pip install pillow")
+            return "break"
+
+        data = ImageGrab.grabclipboard()
+        if data is None:
+            self._log("剪贴板中没有可用图片")
+            return "break"
+
+        added = 0
+        if isinstance(data, list):
+            for p in data:
+                if not isinstance(p, str):
+                    continue
+                ext = os.path.splitext(p)[1].lower()
+                if ext in {".png", ".jpg", ".jpeg", ".bmp", ".webp"} and os.path.isfile(p):
+                    self._add_image_path(p)
+                    added += 1
+        elif hasattr(data, "save"):
+            os.makedirs(self.pasted_image_dir, exist_ok=True)
+            out_path = os.path.join(self.pasted_image_dir, f"clipboard_{int(time.time() * 1000)}.png")
+            data.save(out_path, "PNG")
+            self._add_image_path(out_path)
+            added += 1
+
+        if added:
+            self._log(f"已从剪贴板添加 {added} 张截图")
+        else:
+            self._log("剪贴板内容不是图片")
+        return "break"
 
     def _remove_selected_image(self) -> None:
         sel = self.image_list.curselection()
@@ -646,33 +829,42 @@ class App:
             return
 
         sel = self.case_list.curselection()
-        label = self._case_label(inp, out)
         if sel:
             idx = sel[0]
             self.test_cases[idx] = {"input": inp, "output": out}
-            self.case_list.delete(idx)
-            self.case_list.insert(idx, label)
-            self.case_list.selection_set(idx)
+            self._refresh_case_list(select_idx=idx)
         else:
             self.test_cases.append({"input": inp, "output": out})
-            self.case_list.insert(tk.END, label)
+            self._refresh_case_list(select_idx=len(self.test_cases) - 1)
 
-    def _case_label(self, inp: str, out: str) -> str:
+    def _case_label(self, idx: int, inp: str, out: str) -> str:
         input_lines = inp.count("\n") + (1 if inp else 0)
         has_out = "有输出" if out.strip() else "无输出"
-        return f"Case {len(self.test_cases) + 1} | {input_lines} 行输入 | {has_out}"
+        return f"Case {idx + 1} | {input_lines} 行输入 | {has_out}"
+
+    def _refresh_case_list(self, select_idx: Optional[int] = None) -> None:
+        self.case_list.delete(0, tk.END)
+        for idx, case in enumerate(self.test_cases):
+            self.case_list.insert(
+                tk.END,
+                self._case_label(idx, case.get("input", ""), case.get("output", "")),
+            )
+        if select_idx is not None and 0 <= select_idx < len(self.test_cases):
+            self.case_list.selection_set(select_idx)
+            self.case_list.activate(select_idx)
 
     def _delete_case(self) -> None:
         sel = self.case_list.curselection()
         if not sel:
             return
         idx = sel[0]
-        self.case_list.delete(idx)
         self.test_cases.pop(idx)
+        next_idx = idx if idx < len(self.test_cases) else len(self.test_cases) - 1
+        self._refresh_case_list(select_idx=next_idx if next_idx >= 0 else None)
 
     def _clear_cases(self) -> None:
         self.test_cases.clear()
-        self.case_list.delete(0, tk.END)
+        self._refresh_case_list()
         self.case_input_text.delete("1.0", tk.END)
         self.case_output_text.delete("1.0", tk.END)
 
@@ -704,6 +896,17 @@ class App:
             "test_cases": [dict(c) for c in self.test_cases],
             "output_dir": self.output_dir_var.get().strip() or os.getcwd(),
         }
+
+    def _build_stream_callback(self, stage: str):
+        progress = {"chars": 0, "last_log": 0}
+
+        def on_chunk(chunk: str) -> None:
+            progress["chars"] += len(chunk)
+            if progress["chars"] - progress["last_log"] >= 240:
+                progress["last_log"] = progress["chars"]
+                self._log(f"{stage}流式返回中... {progress['chars']} 字符")
+
+        return on_chunk
 
     def _start(self) -> None:
         payload = self._collect_payload()
@@ -769,6 +972,7 @@ class App:
                 problem_text=problem_text,
                 image_paths=image_paths,
                 logger=self._log,
+                stream_callback=self._build_stream_callback("代码生成"),
             )
 
             code = safe_text(generated.get("code"), "")
@@ -823,6 +1027,7 @@ class App:
                     failure_report=failure_report,
                     test_cases=final_cases,
                     logger=self._log,
+                    stream_callback=self._build_stream_callback("代码修复"),
                 )
                 new_code = safe_text(repaired.get("code"), "")
                 if not new_code:
