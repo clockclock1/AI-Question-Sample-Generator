@@ -1,14 +1,12 @@
 ﻿name: build-executables
 
 on:
-  workflow_dispatch:
-  push:
-    branches:
-      - main
-      - master
-    tags:
-      - 'v*'
-  pull_request:
+  release:
+    types:
+      - published
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -49,7 +47,7 @@ jobs:
         run: |
           pyinstaller --noconfirm --clean --onefile --windowed --name ai-problem-generator ai_problem_generator.py
 
-      - name: Package artifact
+      - name: Package release zip
         run: |
           python - << 'PY'
           import os
@@ -77,9 +75,7 @@ jobs:
           print(f'Created: {archive_path}')
           PY
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
+      - name: Upload asset to release
+        uses: softprops/action-gh-release@v2
         with:
-          name: ai-problem-generator-${{ runner.os }}
-          path: release/*.zip
-          if-no-files-found: error
+          files: release/*.zip

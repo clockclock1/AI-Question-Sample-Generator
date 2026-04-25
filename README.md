@@ -71,12 +71,9 @@ problem_export_1777083194814.zip
 ## GitHub Actions 自动构建
 
 - 已提供工作流：[build-executables.yml](.github/workflows/build-executables.yml)
-- 触发时机：`push(main/master)`、`tag(v*)`、`pull_request`、手动触发 `workflow_dispatch`
+- 触发时机：仅在你发布 Release 时触发（`release: published`）
 - 构建平台：`Windows`、`macOS`、`Linux`
 - 构建工具：`PyInstaller --onefile --windowed`
-- 产物位置：在 Actions 的 Artifacts 中下载
-  - `ai-problem-generator-Windows`
-  - `ai-problem-generator-macOS`
-  - `ai-problem-generator-Linux`
+- 产物位置：直接上传到该次 GitHub Release 的 Assets
 
 每个平台产物是一个 zip，内含对应可执行文件和 `README.md`。
