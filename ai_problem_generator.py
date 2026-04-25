@@ -731,6 +731,10 @@ class App:
         self.log_text.delete("1.0", tk.END)
         self.log_text.configure(state="disabled")
 
+    def _set_code_text(self, code: str) -> None:
+        self.code_text.delete("1.0", tk.END)
+        self.code_text.insert("1.0", code)
+
     def _refresh_models(self) -> None:
         api_url = self.api_url_var.get().strip()
         if not api_url:
@@ -1004,7 +1008,13 @@ class App:
         if not code.strip():
             raise ValueError("最终代码为空，无法执行")
 
-        max_attempts = 3 if not payload["code"].strip() else 1
+        can_repair_with_ai = bool(api_url)
+        max_attempts = 3 if can_repair_with_ai else 1
+        if payload["code"].strip() and can_repair_with_ai:
+            self._log("检测到手动代码：若校验失败将自动调用 AI 修复")
+        elif payload["code"].strip() and not can_repair_with_ai:
+            self._log("检测到手动代码：未配置 API，仅执行一次校验")
+
         final_cases = cases
 
         for attempt in range(1, max_attempts + 1):
@@ -1036,6 +1046,11 @@ class App:
                 self._log("已获取修复后的代码，继续校验")
             else:
                 fail_count = sum(1 for d in details if not d.get("passed"))
+                if not can_repair_with_ai:
+                    raise RuntimeError(
+                        f"校验失败：仍有 {fail_count} 组测试未通过。"
+                        "如需自动修复，请配置 API URL/Key 后重试。"
+                    )
                 raise RuntimeError(f"校验失败：仍有 {fail_count} 组测试未通过")
 
         export_path, zip_path = create_problem_export(
@@ -1048,6 +1063,7 @@ class App:
             logger=self._log,
         )
 
+        self.root.after(0, lambda: self._set_code_text(code))
         return export_path, zip_path
 
 
