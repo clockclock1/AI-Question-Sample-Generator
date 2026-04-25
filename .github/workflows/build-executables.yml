@@ -1,0 +1,85 @@
+﻿name: build-executables
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - 'v*'
+  pull_request:
+
+jobs:
+  build:
+    name: Build on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - windows-latest
+          - ubuntu-latest
+          - macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Tk dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-tk
+
+      - name: Install build dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller
+
+      - name: Build executable with PyInstaller
+        run: |
+          pyinstaller --noconfirm --clean --onefile --windowed --name ai-problem-generator ai_problem_generator.py
+
+      - name: Package artifact
+        run: |
+          python - << 'PY'
+          import os
+          import pathlib
+          import zipfile
+
+          runner_os = os.environ.get('RUNNER_OS', '').lower()
+          binary_name = 'ai-problem-generator.exe' if runner_os == 'windows' else 'ai-problem-generator'
+          binary_path = pathlib.Path('dist') / binary_name
+          if not binary_path.exists():
+              raise SystemExit(f'Binary not found: {binary_path}')
+
+          out_dir = pathlib.Path('release')
+          out_dir.mkdir(parents=True, exist_ok=True)
+
+          archive_name = f'ai-problem-generator-{runner_os}.zip'
+          archive_path = out_dir / archive_name
+
+          with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+              zf.write(binary_path, arcname=binary_name)
+              readme = pathlib.Path('README.md')
+              if readme.exists():
+                  zf.write(readme, arcname='README.md')
+
+          print(f'Created: {archive_path}')
+          PY
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ai-problem-generator-${{ runner.os }}
+          path: release/*.zip
+          if-no-files-found: error
