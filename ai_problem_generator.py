@@ -3,6 +3,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import py_compile
 import queue
 import re
 import shutil
@@ -195,6 +196,16 @@ def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = DEF
         return_code=proc.returncode,
         reason="ok",
     )
+
+
+def compile_python_file(code_path: str) -> Tuple[bool, str]:
+    try:
+        py_compile.compile(code_path, doraise=True)
+        return True, ""
+    except py_compile.PyCompileError as e:
+        return False, str(e)
+    except Exception as e:
+        return False, f"编译检查异常: {e}"
 
 
 def run_and_validate(
@@ -724,6 +735,28 @@ class App:
         self.code_text = tk.Text(code_frame, height=20, wrap="none")
         self.code_text.pack(fill=tk.BOTH, expand=True, padx=8, pady=8)
 
+        runner_frame = ttk.LabelFrame(code_tab, text="代码运行器（像编译器一样先检查再运行）")
+        runner_frame.pack(fill=tk.BOTH, expand=False, padx=2, pady=(0, 2))
+        runner_btn_row = ttk.Frame(runner_frame)
+        runner_btn_row.pack(fill=tk.X, padx=8, pady=(8, 6))
+        self.compile_btn = ttk.Button(runner_btn_row, text="编译检查", command=self._manual_compile_check)
+        self.compile_btn.pack(side=tk.LEFT)
+        self.compile_run_btn = ttk.Button(runner_btn_row, text="编译并运行", command=self._manual_compile_and_run)
+        self.compile_run_btn.pack(side=tk.LEFT, padx=8)
+
+        runner_io = ttk.Frame(runner_frame)
+        runner_io.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        runner_in_box = ttk.Frame(runner_io)
+        runner_out_box = ttk.Frame(runner_io)
+        runner_in_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        runner_out_box.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(8, 0))
+        ttk.Label(runner_in_box, text="运行输入(stdin)").pack(anchor="w")
+        self.run_input_text = tk.Text(runner_in_box, height=7, wrap="word")
+        self.run_input_text.pack(fill=tk.BOTH, expand=True)
+        ttk.Label(runner_out_box, text="运行结果(stdout/stderr)").pack(anchor="w")
+        self.run_output_text = tk.Text(runner_out_box, height=7, wrap="word", state="disabled")
+        self.run_output_text.pack(fill=tk.BOTH, expand=True)
+
         case_frame = ttk.LabelFrame(case_tab, text="测试用例（可多组）")
         case_frame.pack(fill=tk.BOTH, expand=True, padx=2, pady=2)
 
@@ -798,6 +831,94 @@ class App:
     def _set_code_text(self, code: str) -> None:
         self.code_text.delete("1.0", tk.END)
         self.code_text.insert("1.0", code)
+
+    def _set_runner_output(self, text: str) -> None:
+        self.run_output_text.configure(state="normal")
+        self.run_output_text.delete("1.0", tk.END)
+        self.run_output_text.insert("1.0", text)
+        self.run_output_text.configure(state="disabled")
+
+    def _toggle_compile_buttons(self, enabled: bool) -> None:
+        state = "normal" if enabled else "disabled"
+        self.compile_btn.configure(state=state)
+        self.compile_run_btn.configure(state=state)
+
+    def _read_timeout_sec(self) -> int:
+        raw = self.timeout_var.get().strip()
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            return DEFAULT_TIMEOUT_SEC
+
+    def _manual_compile_check(self) -> None:
+        code = clean_code_text(self.code_text.get("1.0", tk.END))
+        if not code:
+            messagebox.showwarning("提示", "请先在代码区输入代码")
+            return
+        timeout_sec = self._read_timeout_sec()
+        self._toggle_compile_buttons(False)
+        self._log("开始手动编译检查...")
+        threading.Thread(
+            target=self._manual_run_worker,
+            args=(code, "", timeout_sec, False),
+            daemon=True,
+        ).start()
+
+    def _manual_compile_and_run(self) -> None:
+        code = clean_code_text(self.code_text.get("1.0", tk.END))
+        if not code:
+            messagebox.showwarning("提示", "请先在代码区输入代码")
+            return
+        run_input = self.run_input_text.get("1.0", tk.END)
+        timeout_sec = self._read_timeout_sec()
+        self._toggle_compile_buttons(False)
+        self._log("开始手动编译并运行...")
+        threading.Thread(
+            target=self._manual_run_worker,
+            args=(code, run_input, timeout_sec, True),
+            daemon=True,
+        ).start()
+
+    def _manual_run_worker(self, code: str, run_input: str, timeout_sec: int, run_after_compile: bool) -> None:
+        try:
+            with tempfile.TemporaryDirectory(prefix="manual_runner_") as run_dir:
+                code_path = write_standard_code_file(code, run_dir)
+                self._log(f"手动模式标准代码文件：{code_path}")
+                ok, compile_msg = compile_python_file(code_path)
+                if not ok:
+                    out = "[Compile] Failed\n\n" + compile_msg
+                    self._log("手动编译检查失败")
+                    self.root.after(0, lambda: self._set_runner_output(out))
+                    return
+
+                if not run_after_compile:
+                    self._log("手动编译检查通过")
+                    self.root.after(0, lambda: self._set_runner_output("[Compile] Success"))
+                    return
+
+                result = run_python_file_once(code_path, run_input, timeout_sec=timeout_sec)
+                out_lines = [
+                    "[Compile] Success",
+                    "",
+                    f"[Run] reason={result.reason}, return_code={result.return_code}, timeout={timeout_sec}s",
+                    "",
+                    "[Stdout]",
+                    result.actual_output if result.actual_output else "<empty>",
+                    "",
+                    "[Stderr]",
+                    result.stderr if result.stderr else "<empty>",
+                ]
+                out = "\n".join(out_lines)
+                if result.ok:
+                    self._log("手动运行完成")
+                else:
+                    self._log(f"手动运行失败：{result.reason}")
+                self.root.after(0, lambda: self._set_runner_output(out))
+        except Exception as e:
+            self._log(f"手动运行异常：{e}")
+            self.root.after(0, lambda: self._set_runner_output(f"[Error]\n{e}"))
+        finally:
+            self.root.after(0, lambda: self._toggle_compile_buttons(True))
 
     def _refresh_models(self) -> None:
         api_url = self.api_url_var.get().strip()
@@ -1094,12 +1215,32 @@ class App:
             with tempfile.TemporaryDirectory(prefix="ai_problem_runner_") as run_dir:
                 code_path = write_standard_code_file(code, run_dir)
                 self._log(f"本轮执行标准代码文件：{code_path}")
-                passed, details, adjusted_cases = run_and_validate(
-                    code_path,
-                    final_cases,
-                    self._log,
-                    timeout_sec=timeout_sec,
-                )
+                compile_ok, compile_msg = compile_python_file(code_path)
+                if not compile_ok:
+                    self._log("编译检查失败")
+                    passed = False
+                    details = [
+                        {
+                            "index": 0,
+                            "input": "",
+                            "expected": "",
+                            "actual": "",
+                            "stderr": compile_msg,
+                            "return_code": 1,
+                            "reason": "compile_error",
+                            "passed": False,
+                            "compared": False,
+                        }
+                    ]
+                    adjusted_cases = final_cases
+                else:
+                    self._log("编译检查通过，开始执行测试")
+                    passed, details, adjusted_cases = run_and_validate(
+                        code_path,
+                        final_cases,
+                        self._log,
+                        timeout_sec=timeout_sec,
+                    )
             final_cases = adjusted_cases
 
             if passed:
