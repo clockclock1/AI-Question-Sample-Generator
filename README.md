@@ -12,6 +12,7 @@
 - 自动运行代码并测试校验
 - 手动代码若校验失败且已配置 API，会自动进入 AI 修复重试
 - 按 `problem_export_<timestamp>` 格式导出，并自动打包 zip
+- 校验时会把标准代码写入独立 `standard_solution.py` 后再执行
 
 ## 运行方式
 

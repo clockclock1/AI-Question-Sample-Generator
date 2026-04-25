@@ -138,51 +138,63 @@ class RunResult:
     reason: str
 
 
-def run_python_code_once(code: str, case_input: str, timeout_sec: int = 8) -> RunResult:
-    with tempfile.TemporaryDirectory(prefix="ai_problem_runner_") as tmp_dir:
-        code_path = os.path.join(tmp_dir, "solution.py")
-        with open(code_path, "w", encoding="utf-8") as f:
-            f.write(code)
+def clean_code_text(code: str) -> str:
+    text = (code or "").strip()
+    if not text:
+        return ""
+    fenced = re.match(r"^\s*```(?:python|py)?\s*([\s\S]*?)\s*```\s*$", text, re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+    return text.replace("\r\n", "\n").replace("\r", "\n")
 
-        try:
-            proc = subprocess.run(
-                [sys.executable, code_path],
-                input=case_input,
-                text=True,
-                capture_output=True,
-                timeout=timeout_sec,
-                encoding="utf-8",
-                errors="replace",
-            )
-        except subprocess.TimeoutExpired:
-            return RunResult(
-                ok=False,
-                actual_output="",
-                stderr="Execution timed out",
-                return_code=-1,
-                reason="timeout",
-            )
 
-        if proc.returncode != 0:
-            return RunResult(
-                ok=False,
-                actual_output=proc.stdout,
-                stderr=proc.stderr,
-                return_code=proc.returncode,
-                reason="runtime_error",
-            )
+def write_standard_code_file(code: str, tmp_dir: str) -> str:
+    code_path = os.path.join(tmp_dir, "standard_solution.py")
+    with open(code_path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(clean_code_text(code))
+    return code_path
 
+
+def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = 8) -> RunResult:
+    try:
+        proc = subprocess.run(
+            [sys.executable, code_path],
+            input=case_input,
+            text=True,
+            capture_output=True,
+            timeout=timeout_sec,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except subprocess.TimeoutExpired:
         return RunResult(
-            ok=True,
+            ok=False,
+            actual_output="",
+            stderr="Execution timed out",
+            return_code=-1,
+            reason="timeout",
+        )
+
+    if proc.returncode != 0:
+        return RunResult(
+            ok=False,
             actual_output=proc.stdout,
             stderr=proc.stderr,
             return_code=proc.returncode,
-            reason="ok",
+            reason="runtime_error",
         )
+
+    return RunResult(
+        ok=True,
+        actual_output=proc.stdout,
+        stderr=proc.stderr,
+        return_code=proc.returncode,
+        reason="ok",
+    )
 
 
 def run_and_validate(
-    code: str,
+    code_path: str,
     test_cases: List[Dict[str, str]],
     logger,
 ) -> Tuple[bool, List[Dict[str, Any]], List[Dict[str, str]]]:
@@ -194,7 +206,7 @@ def run_and_validate(
         inp = case.get("input", "")
         expected = case.get("output", "")
         logger(f"执行第 {idx} 组测试...")
-        result = run_python_code_once(code, inp)
+        result = run_python_file_once(code_path, inp)
 
         actual_norm = normalize_text_output(result.actual_output)
         expected_norm = normalize_text_output(expected)
@@ -955,7 +967,7 @@ class App:
         image_paths = payload["image_paths"]
         output_dir = payload["output_dir"]
 
-        code = payload["code"]
+        code = clean_code_text(payload["code"])
         cases = payload["test_cases"]
 
         title = user_title or "未命名题目"
@@ -979,7 +991,7 @@ class App:
                 stream_callback=self._build_stream_callback("代码生成"),
             )
 
-            code = safe_text(generated.get("code"), "")
+            code = clean_code_text(safe_text(generated.get("code"), ""))
             if not code:
                 raise RuntimeError("AI 返回中没有 code 字段")
 
@@ -1019,7 +1031,10 @@ class App:
 
         for attempt in range(1, max_attempts + 1):
             self._log(f"开始执行校验，尝试 {attempt}/{max_attempts}")
-            passed, details, adjusted_cases = run_and_validate(code, final_cases, self._log)
+            with tempfile.TemporaryDirectory(prefix="ai_problem_runner_") as run_dir:
+                code_path = write_standard_code_file(code, run_dir)
+                self._log(f"本轮执行标准代码文件：{code_path}")
+                passed, details, adjusted_cases = run_and_validate(code_path, final_cases, self._log)
             final_cases = adjusted_cases
 
             if passed:
@@ -1039,7 +1054,7 @@ class App:
                     logger=self._log,
                     stream_callback=self._build_stream_callback("代码修复"),
                 )
-                new_code = safe_text(repaired.get("code"), "")
+                new_code = clean_code_text(safe_text(repaired.get("code"), ""))
                 if not new_code:
                     raise RuntimeError("AI 修复返回为空代码")
                 code = new_code
