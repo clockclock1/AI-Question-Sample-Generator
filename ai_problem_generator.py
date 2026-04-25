@@ -1,13 +1,13 @@
 ﻿import base64
 import hashlib
+import io
 import json
 import mimetypes
+import multiprocessing as mp
 import os
-import py_compile
 import queue
 import re
 import shutil
-import subprocess
 import sys
 import tempfile
 import threading
@@ -43,6 +43,8 @@ LANGUAGES = [
 
 DEFAULT_TIMEOUT_SEC = 15
 APP_CONFIG_FILENAME = "app_config.json"
+TARGET_EXPORT_CASE_COUNT = 16
+MAX_EXPORT_CASE_COUNT = 24
 
 
 SYSTEM_PROMPT = (
@@ -161,18 +163,65 @@ def write_standard_code_file(code: str, tmp_dir: str) -> str:
     return code_path
 
 
-def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> RunResult:
+def _execute_code_worker(code_path: str, case_input: str, out_queue) -> None:
+    stdout_buf = io.StringIO()
+    stderr_buf = io.StringIO()
+    old_stdin, old_stdout, old_stderr = sys.stdin, sys.stdout, sys.stderr
     try:
-        proc = subprocess.run(
-            [sys.executable, code_path],
-            input=case_input,
-            text=True,
-            capture_output=True,
-            timeout=timeout_sec,
-            encoding="utf-8",
-            errors="replace",
+        with open(code_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        code_obj = compile(source, code_path, "exec")
+
+        sys.stdin = io.StringIO(case_input)
+        sys.stdout = stdout_buf
+        sys.stderr = stderr_buf
+        glb = {"__name__": "__main__", "__file__": code_path}
+        exec(code_obj, glb, glb)
+        out_queue.put(
+            {
+                "ok": True,
+                "actual_output": stdout_buf.getvalue(),
+                "stderr": stderr_buf.getvalue(),
+                "return_code": 0,
+                "reason": "ok",
+            }
         )
-    except subprocess.TimeoutExpired:
+    except SystemExit as e:
+        code = e.code if isinstance(e.code, int) else 0
+        out_queue.put(
+            {
+                "ok": code == 0,
+                "actual_output": stdout_buf.getvalue(),
+                "stderr": stderr_buf.getvalue(),
+                "return_code": int(code) if isinstance(code, int) else 0,
+                "reason": "ok" if code == 0 else "runtime_error",
+            }
+        )
+    except Exception:
+        traceback.print_exc(file=stderr_buf)
+        out_queue.put(
+            {
+                "ok": False,
+                "actual_output": stdout_buf.getvalue(),
+                "stderr": stderr_buf.getvalue(),
+                "return_code": 1,
+                "reason": "runtime_error",
+            }
+        )
+    finally:
+        sys.stdin, sys.stdout, sys.stderr = old_stdin, old_stdout, old_stderr
+
+
+def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> RunResult:
+    ctx = mp.get_context("spawn")
+    out_queue = ctx.Queue()
+    proc = ctx.Process(target=_execute_code_worker, args=(code_path, case_input, out_queue))
+    proc.start()
+    proc.join(timeout_sec)
+
+    if proc.is_alive():
+        proc.terminate()
+        proc.join()
         return RunResult(
             ok=False,
             actual_output="",
@@ -181,30 +230,38 @@ def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = DEF
             reason="timeout",
         )
 
-    if proc.returncode != 0:
+    payload = None
+    try:
+        payload = out_queue.get_nowait()
+    except Exception:
+        payload = None
+
+    if not isinstance(payload, dict):
         return RunResult(
             ok=False,
-            actual_output=proc.stdout,
-            stderr=proc.stderr,
-            return_code=proc.returncode,
+            actual_output="",
+            stderr=f"Worker exited unexpectedly with code {proc.exitcode}",
+            return_code=proc.exitcode if proc.exitcode is not None else 1,
             reason="runtime_error",
         )
 
     return RunResult(
-        ok=True,
-        actual_output=proc.stdout,
-        stderr=proc.stderr,
-        return_code=proc.returncode,
-        reason="ok",
+        ok=bool(payload.get("ok")),
+        actual_output=str(payload.get("actual_output", "")),
+        stderr=str(payload.get("stderr", "")),
+        return_code=int(payload.get("return_code", 1)),
+        reason=str(payload.get("reason", "runtime_error")),
     )
 
 
 def compile_python_file(code_path: str) -> Tuple[bool, str]:
     try:
-        py_compile.compile(code_path, doraise=True)
+        with open(code_path, "r", encoding="utf-8") as f:
+            source = f.read()
+        compile(source, code_path, "exec")
         return True, ""
-    except py_compile.PyCompileError as e:
-        return False, str(e)
+    except SyntaxError:
+        return False, traceback.format_exc()
     except Exception as e:
         return False, f"编译检查异常: {e}"
 
@@ -267,6 +324,27 @@ def run_and_validate(
         details.append(item)
 
     return all_pass, details, repaired_cases
+
+
+def fill_outputs_with_code(
+    code_path: str,
+    cases: List[Dict[str, str]],
+    timeout_sec: int,
+    logger,
+) -> List[Dict[str, str]]:
+    ready: List[Dict[str, str]] = []
+    for idx, case in enumerate(cases, start=1):
+        inp = str(case.get("input", ""))
+        out = str(case.get("output", ""))
+        if out.strip():
+            ready.append({"input": inp, "output": out})
+            continue
+        res = run_python_file_once(code_path, inp, timeout_sec=timeout_sec)
+        if not res.ok:
+            logger(f"扩展样例第 {idx} 组执行失败，已跳过：{res.reason}")
+            continue
+        ready.append({"input": inp, "output": normalize_text_output(res.actual_output)})
+    return ready
 
 
 def build_failure_report(details: List[Dict[str, Any]]) -> str:
@@ -523,6 +601,57 @@ def repair_code_with_ai(
     raw = post_chat_completions_stream(api_url, api_key, model, messages, on_chunk=stream_callback)
     parsed = extract_json_block(raw)
     return parsed
+
+
+def _dedupe_cases_keep_order(cases: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    seen = set()
+    out: List[Dict[str, str]] = []
+    for case in cases:
+        inp = str(case.get("input", ""))
+        outp = str(case.get("output", ""))
+        key = (inp, outp)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"input": inp, "output": outp})
+    return out
+
+
+def enrich_test_cases_with_ai(
+    api_url: str,
+    api_key: str,
+    model: str,
+    problem_text: str,
+    existing_cases: List[Dict[str, str]],
+    logger,
+    stream_callback=None,
+) -> List[Dict[str, str]]:
+    existing_inputs = [str(c.get("input", "")) for c in existing_cases]
+    prompt = (
+        "请为这道题补充更多高覆盖测试输入。"
+        f"目标总数至少 {TARGET_EXPORT_CASE_COUNT} 组，覆盖边界、极值、重复值、升降序、随机混合、退化场景。"
+        "只返回 JSON：{\"test_cases\":[{\"input\":\"...\"}]}，不要输出 output。"
+        "每组输入应可在评测机快速运行，不要构造超大压力数据。\n"
+        f"题目文本:\n{problem_text}\n\n"
+        f"已有输入（避免重复）:\n{json.dumps(existing_inputs, ensure_ascii=False)}"
+    )
+    messages = [
+        {"role": "system", "content": "你是算法题测试数据生成助手，只返回 JSON。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    logger("调用 AI 扩展测试样例中（流式）...")
+    raw = post_chat_completions_stream(api_url, api_key, model, messages, on_chunk=stream_callback)
+    parsed = extract_json_block(raw)
+    raw_cases = parsed.get("test_cases") or []
+    out: List[Dict[str, str]] = []
+    if isinstance(raw_cases, list):
+        for item in raw_cases:
+            if isinstance(item, dict):
+                inp = str(item.get("input", ""))
+                if inp.strip():
+                    out.append({"input": inp, "output": ""})
+    return out
 
 
 def safe_text(value: Optional[str], default: str) -> str:
@@ -1284,6 +1413,7 @@ class App:
             self._log("检测到手动代码：未配置 API，仅执行一次校验")
 
         final_cases = cases
+        verified_code_path = ""
 
         for attempt in range(1, max_attempts + 1):
             self._log(f"开始执行校验，尝试 {attempt}/{max_attempts}")
@@ -1320,6 +1450,7 @@ class App:
 
             if passed:
                 self._log("代码校验通过")
+                verified_code_path = code_path
                 break
 
             if attempt < max_attempts:
@@ -1355,6 +1486,40 @@ class App:
                     )
                 raise RuntimeError(f"校验失败：仍有 {fail_count} 组测试未通过")
 
+        if not verified_code_path:
+            raise RuntimeError("未找到已通过校验的执行文件")
+
+        final_cases = _dedupe_cases_keep_order(
+            [{"input": str(c.get("input", "")), "output": str(c.get("output", ""))} for c in final_cases]
+        )
+
+        if len(final_cases) < TARGET_EXPORT_CASE_COUNT and can_repair_with_ai:
+            try:
+                extra_inputs = enrich_test_cases_with_ai(
+                    api_url=api_url,
+                    api_key=api_key,
+                    model=model,
+                    problem_text=problem_text,
+                    existing_cases=final_cases,
+                    logger=self._log,
+                    stream_callback=self._build_stream_callback("样例扩展"),
+                )
+                merged = final_cases + extra_inputs
+                merged = _dedupe_cases_keep_order(merged)
+                merged = merged[:MAX_EXPORT_CASE_COUNT]
+                final_cases = fill_outputs_with_code(
+                    verified_code_path,
+                    merged,
+                    timeout_sec=timeout_sec,
+                    logger=self._log,
+                )
+                self._log(f"样例扩展后共 {len(final_cases)} 组")
+            except Exception as e:
+                self._log(f"样例扩展失败，保留当前样例：{e}")
+
+        if len(final_cases) > MAX_EXPORT_CASE_COUNT:
+            final_cases = final_cases[:MAX_EXPORT_CASE_COUNT]
+
         export_path, zip_path = create_problem_export(
             output_dir=output_dir,
             title=title,
@@ -1370,6 +1535,7 @@ class App:
 
 
 def main() -> None:
+    mp.freeze_support()
     root = tk.Tk()
     app = App(root)
     app._log("应用启动完成")
