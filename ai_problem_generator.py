@@ -40,10 +40,14 @@ LANGUAGES = [
     "Python2",
 ]
 
+DEFAULT_TIMEOUT_SEC = 15
+
 
 SYSTEM_PROMPT = (
     "你是一个算法竞赛题代码生成助手。"
     "请根据题目描述（可能包含截图信息）生成可运行的 Python3 代码，并给出可用于校验的测试样例。"
+    "程序必须是非交互式评测程序：从标准输入读取，输出后立即结束。"
+    "禁止无限循环等待输入，禁止交互式提示语。"
     "你必须只返回 JSON，不要返回 markdown。JSON 结构必须为："
     "{"
     '"title":"题目标题",'
@@ -155,7 +159,7 @@ def write_standard_code_file(code: str, tmp_dir: str) -> str:
     return code_path
 
 
-def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = 8) -> RunResult:
+def run_python_file_once(code_path: str, case_input: str, timeout_sec: int = DEFAULT_TIMEOUT_SEC) -> RunResult:
     try:
         proc = subprocess.run(
             [sys.executable, code_path],
@@ -197,6 +201,7 @@ def run_and_validate(
     code_path: str,
     test_cases: List[Dict[str, str]],
     logger,
+    timeout_sec: int = DEFAULT_TIMEOUT_SEC,
 ) -> Tuple[bool, List[Dict[str, Any]], List[Dict[str, str]]]:
     details: List[Dict[str, Any]] = []
     repaired_cases: List[Dict[str, str]] = []
@@ -206,7 +211,7 @@ def run_and_validate(
         inp = case.get("input", "")
         expected = case.get("output", "")
         logger(f"执行第 {idx} 组测试...")
-        result = run_python_file_once(code_path, inp)
+        result = run_python_file_once(code_path, inp, timeout_sec=timeout_sec)
 
         actual_norm = normalize_text_output(result.actual_output)
         expected_norm = normalize_text_output(expected)
@@ -270,6 +275,45 @@ def build_failure_report(details: List[Dict[str, Any]]) -> str:
             lines.append(d.get("stderr", ""))
         lines.append("")
     return "\n".join(lines).strip()
+
+
+def build_repair_hint(details: List[Dict[str, Any]], timeout_sec: int) -> str:
+    if not details:
+        return ""
+    timeout_count = sum(1 for d in details if d.get("reason") == "timeout")
+    fail_count = sum(1 for d in details if not d.get("passed"))
+    if fail_count == 0:
+        return ""
+    if timeout_count == fail_count:
+        return (
+            f"所有失败用例都在 {timeout_sec} 秒内超时。"
+            "请从头重写为非交互式标准输入输出程序，严禁 while True 无条件循环，"
+            "严禁等待额外输入；读取完输入后必须立即计算并结束。"
+            "请优先使用 O(n) 或 O(n log n) 算法。"
+        )
+    if timeout_count > 0:
+        return (
+            f"存在 {timeout_count}/{fail_count} 个超时用例（单测超时 {timeout_sec} 秒）。"
+            "请优化复杂度并避免任何可能阻塞输入的逻辑。"
+        )
+    return ""
+
+
+def compact_cases_for_prompt(
+    test_cases: List[Dict[str, str]],
+    max_cases: int = 5,
+    max_chars: int = 1200,
+) -> List[Dict[str, str]]:
+    compact: List[Dict[str, str]] = []
+    for case in test_cases[:max_cases]:
+        inp = str(case.get("input", ""))
+        out = str(case.get("output", ""))
+        if len(inp) > max_chars:
+            inp = inp[:max_chars] + "\n...<truncated>..."
+        if len(out) > max_chars:
+            out = out[:max_chars] + "\n...<truncated>..."
+        compact.append({"input": inp, "output": out})
+    return compact
 
 
 def post_chat_completions_stream(
@@ -409,6 +453,7 @@ def generate_code_with_ai(
             "text": (
                 "请根据以下题目内容生成正确代码与样例。"
                 "必须返回 JSON 且仅返回 JSON。\n"
+                "test_cases 请给 2-5 组可快速运行的小规模功能样例，不要给压力测试大数据。\n"
                 f"题目文本:\n{problem_text}"
             ),
         }
@@ -442,15 +487,19 @@ def repair_code_with_ai(
     failure_report: str,
     test_cases: List[Dict[str, str]],
     logger,
+    repair_hint: str = "",
     stream_callback=None,
 ) -> Dict[str, Any]:
+    compact_cases = compact_cases_for_prompt(test_cases)
+
     fix_prompt = (
         "你之前生成的代码未通过测试，请修复。"
         "必须返回 JSON 且仅返回 JSON，结构与之前相同。\n"
         f"题目文本:\n{problem_text}\n\n"
         f"旧代码:\n{previous_code}\n\n"
+        f"修复约束:\n{repair_hint or '保持标准输入输出并通过所有测试'}\n\n"
         f"失败报告:\n{failure_report}\n\n"
-        f"测试用例(JSON):\n{json.dumps(test_cases, ensure_ascii=False)}"
+        f"测试用例(JSON):\n{json.dumps(compact_cases, ensure_ascii=False)}"
     )
 
     messages = [
@@ -619,6 +668,9 @@ class App:
         self.refresh_models_btn = ttk.Button(config_frame, text="拉取模型", command=self._refresh_models)
         self.refresh_models_btn.grid(row=2, column=2, sticky="w", padx=6, pady=6)
         ttk.Label(config_frame, text="流式请求: 已启用").grid(row=2, column=3, sticky="w", padx=6, pady=6)
+        ttk.Label(config_frame, text="单测超时(秒)").grid(row=3, column=0, sticky="w", padx=6, pady=6)
+        self.timeout_var = tk.StringVar(value=str(DEFAULT_TIMEOUT_SEC))
+        ttk.Entry(config_frame, textvariable=self.timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=6, pady=6)
         config_frame.columnconfigure(1, weight=3)
         config_frame.columnconfigure(4, weight=2)
 
@@ -911,6 +963,7 @@ class App:
             "code": self.code_text.get("1.0", tk.END).strip(),
             "test_cases": [dict(c) for c in self.test_cases],
             "output_dir": self.output_dir_var.get().strip() or os.getcwd(),
+            "timeout_sec": self.timeout_var.get().strip(),
         }
 
     def _build_stream_callback(self, stage: str):
@@ -966,6 +1019,11 @@ class App:
         user_title = payload["title"]
         image_paths = payload["image_paths"]
         output_dir = payload["output_dir"]
+        timeout_raw = str(payload.get("timeout_sec", str(DEFAULT_TIMEOUT_SEC))).strip()
+        try:
+            timeout_sec = max(1, int(timeout_raw))
+        except ValueError:
+            timeout_sec = DEFAULT_TIMEOUT_SEC
 
         code = clean_code_text(payload["code"])
         cases = payload["test_cases"]
@@ -1020,6 +1078,8 @@ class App:
         if not code.strip():
             raise ValueError("最终代码为空，无法执行")
 
+        self._log(f"执行超时设置：单测 {timeout_sec} 秒")
+
         can_repair_with_ai = bool(api_url)
         max_attempts = 3 if can_repair_with_ai else 1
         if payload["code"].strip() and can_repair_with_ai:
@@ -1034,7 +1094,12 @@ class App:
             with tempfile.TemporaryDirectory(prefix="ai_problem_runner_") as run_dir:
                 code_path = write_standard_code_file(code, run_dir)
                 self._log(f"本轮执行标准代码文件：{code_path}")
-                passed, details, adjusted_cases = run_and_validate(code_path, final_cases, self._log)
+                passed, details, adjusted_cases = run_and_validate(
+                    code_path,
+                    final_cases,
+                    self._log,
+                    timeout_sec=timeout_sec,
+                )
             final_cases = adjusted_cases
 
             if passed:
@@ -1043,6 +1108,9 @@ class App:
 
             if attempt < max_attempts:
                 failure_report = build_failure_report(details)
+                repair_hint = build_repair_hint(details, timeout_sec)
+                if repair_hint:
+                    self._log(f"修复提示：{repair_hint}")
                 repaired = repair_code_with_ai(
                     api_url=api_url,
                     api_key=api_key,
@@ -1052,6 +1120,7 @@ class App:
                     failure_report=failure_report,
                     test_cases=final_cases,
                     logger=self._log,
+                    repair_hint=repair_hint,
                     stream_callback=self._build_stream_callback("代码修复"),
                 )
                 new_code = clean_code_text(safe_text(repaired.get("code"), ""))
