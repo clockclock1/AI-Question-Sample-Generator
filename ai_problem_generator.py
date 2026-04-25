@@ -42,6 +42,7 @@ LANGUAGES = [
 ]
 
 DEFAULT_TIMEOUT_SEC = 15
+APP_CONFIG_FILENAME = "app_config.json"
 
 
 SYSTEM_PROMPT = (
@@ -653,10 +654,71 @@ class App:
         self.image_paths: List[str] = []
         self.pasted_image_dir = os.path.join(os.getcwd(), "pasted_images")
         self.runtime_solution_dir = os.path.join(os.getcwd(), "runtime_solutions")
+        self.app_config_path = os.path.join(os.getcwd(), APP_CONFIG_FILENAME)
+        self._save_config_after_id: Optional[str] = None
+        self.app_config = self._load_app_config()
 
         self._build_ui()
+        self._bind_config_auto_save()
+        self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.bind_all("<Control-Shift-V>", self._paste_image_from_clipboard)
         self.root.after(100, self._drain_log_queue)
+
+    def _cfg(self, key: str, default: str = "") -> str:
+        value = self.app_config.get(key, default)
+        return str(value) if value is not None else default
+
+    def _load_app_config(self) -> Dict[str, Any]:
+        if not os.path.isfile(self.app_config_path):
+            return {}
+        try:
+            with open(self.app_config_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except Exception:
+            return {}
+        return {}
+
+    def _collect_app_config(self) -> Dict[str, Any]:
+        return {
+            "api_url": self.api_url_var.get().strip(),
+            "api_key": self.api_key_var.get().strip(),
+            "model": self.model_var.get().strip(),
+            "timeout_sec": self.timeout_var.get().strip(),
+            "output_dir": self.output_dir_var.get().strip(),
+        }
+
+    def _save_app_config(self) -> None:
+        data = self._collect_app_config()
+        with open(self.app_config_path, "w", encoding="utf-8", newline="\n") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+
+    def _schedule_save_config(self, *_args) -> None:
+        if self._save_config_after_id:
+            self.root.after_cancel(self._save_config_after_id)
+        self._save_config_after_id = self.root.after(400, self._save_config_now)
+
+    def _save_config_now(self) -> None:
+        self._save_config_after_id = None
+        try:
+            self._save_app_config()
+        except Exception as e:
+            self._log(f"配置保存失败：{e}")
+
+    def _bind_config_auto_save(self) -> None:
+        self.api_url_var.trace_add("write", self._schedule_save_config)
+        self.api_key_var.trace_add("write", self._schedule_save_config)
+        self.model_var.trace_add("write", self._schedule_save_config)
+        self.timeout_var.trace_add("write", self._schedule_save_config)
+        self.output_dir_var.trace_add("write", self._schedule_save_config)
+
+    def _on_close(self) -> None:
+        try:
+            self._save_app_config()
+        except Exception:
+            pass
+        self.root.destroy()
 
     def _build_ui(self) -> None:
         main = ttk.Frame(self.root, padding=10)
@@ -666,22 +728,22 @@ class App:
         config_frame.pack(fill=tk.X, padx=2, pady=4)
 
         ttk.Label(config_frame, text="API URL").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.api_url_var = tk.StringVar(value="https://api.openai.com/v1")
+        self.api_url_var = tk.StringVar(value=self._cfg("api_url", "https://api.openai.com/v1"))
         ttk.Entry(config_frame, textvariable=self.api_url_var).grid(row=0, column=1, columnspan=4, sticky="we", padx=6, pady=6)
 
         ttk.Label(config_frame, text="API Key").grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        self.api_key_var = tk.StringVar()
+        self.api_key_var = tk.StringVar(value=self._cfg("api_key", ""))
         ttk.Entry(config_frame, textvariable=self.api_key_var, show="*").grid(row=1, column=1, columnspan=4, sticky="we", padx=6, pady=6)
 
         ttk.Label(config_frame, text="Model").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        self.model_var = tk.StringVar(value="gpt-4o-mini")
+        self.model_var = tk.StringVar(value=self._cfg("model", "gpt-4o-mini"))
         self.model_combo = ttk.Combobox(config_frame, textvariable=self.model_var, values=["gpt-4o-mini"])
         self.model_combo.grid(row=2, column=1, sticky="we", padx=6, pady=6)
         self.refresh_models_btn = ttk.Button(config_frame, text="拉取模型", command=self._refresh_models)
         self.refresh_models_btn.grid(row=2, column=2, sticky="w", padx=6, pady=6)
         ttk.Label(config_frame, text="流式请求: 已启用").grid(row=2, column=3, sticky="w", padx=6, pady=6)
         ttk.Label(config_frame, text="单测超时(秒)").grid(row=3, column=0, sticky="w", padx=6, pady=6)
-        self.timeout_var = tk.StringVar(value=str(DEFAULT_TIMEOUT_SEC))
+        self.timeout_var = tk.StringVar(value=self._cfg("timeout_sec", str(DEFAULT_TIMEOUT_SEC)))
         ttk.Entry(config_frame, textvariable=self.timeout_var, width=10).grid(row=3, column=1, sticky="w", padx=6, pady=6)
         config_frame.columnconfigure(1, weight=3)
         config_frame.columnconfigure(4, weight=2)
@@ -791,7 +853,7 @@ class App:
         output_frame.pack(fill=tk.X, padx=2, pady=4)
 
         ttk.Label(output_frame, text="输出目录").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        self.output_dir_var = tk.StringVar(value=os.getcwd())
+        self.output_dir_var = tk.StringVar(value=self._cfg("output_dir", os.getcwd()))
         ttk.Entry(output_frame, textvariable=self.output_dir_var).grid(row=0, column=1, sticky="we", padx=6, pady=6)
         ttk.Button(output_frame, text="选择目录", command=self._choose_output_dir).grid(row=0, column=2, padx=6, pady=6)
         output_frame.columnconfigure(1, weight=1)
@@ -1109,6 +1171,7 @@ class App:
 
     def _start(self) -> None:
         payload = self._collect_payload()
+        self._save_config_now()
         if not payload["problem_text"] and not payload["image_paths"]:
             messagebox.showerror("错误", "请填写题目文字信息或上传至少一张截图")
             return

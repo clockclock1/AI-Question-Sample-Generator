@@ -15,6 +15,7 @@
 - 手动代码若校验失败且已配置 API，会自动进入 AI 修复重试
 - 按 `problem_export_<timestamp>` 格式导出，并自动打包 zip
 - 校验与手动运行都会把被执行代码落盘到 `runtime_solutions/*.py` 后再执行（可追溯）
+- 配置会自动持久化到根目录 `app_config.json`，下次启动自动加载
 
 ## 运行方式
 

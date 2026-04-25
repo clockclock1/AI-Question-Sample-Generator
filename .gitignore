@@ -4,3 +4,6 @@ build/
 dist/
 release/
 *.spec
+app_config.json
+pasted_images/
+runtime_solutions/
